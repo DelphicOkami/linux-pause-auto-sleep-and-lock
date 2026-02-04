@@ -88,22 +88,7 @@ Restart=on-failure
 WantedBy=default.target
 ```
 
-## Troubleshooting
-- If you see D-Bus errors, ensure your session D-Bus is available and `python3-dbus` is installed.
-- If icons do not appear in Plasma widgets, use the desktop entry name rather than a human-readable app name.
-
-## Credits & Resources
-- Idle Inhibition Service Draft: https://people.freedesktop.org/~hadess/idle-inhibition-spec/index.html
-- Based on `gnome-inhibit` gist by @fxthomas: https://gist.github.com/fxthomas/9bdfadd972eaf7100b374042faac28c2
-
-License: See the `LICENSE` file in this repository.
-
-## Contributors
-
-- **Luis Bocanegra** - original author and maintainer
-- **Contributors & contributors list** - thank you to anyone who filed issues, suggested improvements, or contributed patches. If you'd like your name listed here, open a pull request or an issue and I'll add you.
-
-## Caffeine (tray) — GUI controller
+## Caffeine (tray) — KDE 6 GUI controller
 
 This repository includes a small system tray application, "Caffeine", that
 controls `pause-auto-sleep` from the KDE/Qt system tray. It ships as
@@ -137,4 +122,20 @@ Icons:
   `icons/caffeine-off.svg`. The tray app prefers these bundled SVGs but
   will fall back to the desktop theme icons if they are missing.
 
-  - **DelphicOkami** - Updated applet for use with KDE 6 
+
+
+## Troubleshooting
+- If you see D-Bus errors, ensure your session D-Bus is available and `python3-dbus` is installed.
+- If icons do not appear in Plasma widgets, use the desktop entry name rather than a human-readable app name.
+
+## Credits & Resources
+- Idle Inhibition Service Draft: https://people.freedesktop.org/~hadess/idle-inhibition-spec/index.html
+- Based on `gnome-inhibit` gist by @fxthomas: https://gist.github.com/fxthomas/9bdfadd972eaf7100b374042faac28c2
+
+License: See the `LICENSE` file in this repository.
+
+## Contributors
+
+- **Luis Bocanegra** - original author and maintainer
+- **Contributors & contributors list** - thank you to anyone who filed issues, suggested improvements, or contributed patches. If you'd like your name listed here, open a pull request or an issue and I'll add you.
+  - **DelphicOkami** - Updated applet for use with KDE 6 & added caffination
