@@ -1,33 +1,27 @@
-#!/usr/bin/python
-# coding=utf-8
-# Pause auto sleep and screen locking
-# Author: Luis Bocanegra
-# repo: https://github.com/luisbocanegra/linux-pause-auto-sleep-and-lock
-# based on https://gist.github.com/fxthomas/9bdfadd972eaf7100b374042faac28c2
+#!/usr/bin/env python3
+"""pause-auto-sleep
 
-# Usage with application + reason:
-# pause-auto-sleep "application_name or desktop.entry.name" "reason_for_inhibit"
+Small utility to request an idle inhibition from the session power
+management D-Bus interface so automatic suspend and screen locking are
+temporarily prevented.
 
-# To show the app icon and name in the Plasma's Battery and Brightness widget:
-# "application_name" should be set to the program name or desktop entry name.
-# To get a program desktop entry name use the following command
-# ls /usr/share/applications .local/share/applications/ | grep -i YOUR_PROGRAM_NAME
+Usage examples:
+    pause-auto-sleep "application_name or desktop.entry.name" "reason_for_inhibit"
+    pause-auto-sleep         # toggle mode: defaults to inhibitor "User" and reason "Manually enabled"
 
-# Example: pause-auto-sleep org.kde.konsole ssh
-
-
-# Usage without arguments (Toggle mode):
-
-# When running without arguments:
-# - application willl be set as "User"
-# - reason will be set as "Manually enabled"
-# If the script is run a second time,
-# it will look for existing inhibitor process and stop it, ending the inhibition
+To show an application icon/name in KDE Plasma widgets, use the desktop
+entry name (e.g. `org.kde.konsole`). To locate desktop entry files:
+    ls /usr/share/applications ~/.local/share/applications | grep -i YOUR_PROGRAM_NAME
+"""
 
 import atexit
 import functools
 import sys
-import dbus
+try:
+    import dbus
+except ImportError:
+    print("Error: python-dbus bindings are required. Install your distro package (e.g. python3-dbus) and try again.", file=sys.stderr)
+    sys.exit(1)
 import tempfile
 import os
 import signal
@@ -37,56 +31,84 @@ import argparse
 from multiprocessing.connection import Listener, Client
 import socket
 from enum import Enum
+from typing import Callable, Optional, List
 
-_exit_functions = set()
-_previous_exit_functions = set()
+_registered_cleanup: List[Callable[[], None]] = []
+_atexit_registered = False
 
 def get_all_signals():
+    """Return a list of signals that should trigger cleanup handlers.
+
+    This list is used as a sensible default set of signals to register
+    for cleanup/exit handling.
+    """
     return [signal.SIGINT, signal.SIGTERM, signal.SIGTRAP, signal.SIGABRT, signal.SIGBUS, signal.SIGALRM]
 
-def register_exit_function(fun: callable, signals=[]):
-    def ef_wrapper():
-        if fun not in _previous_exit_functions:
+def register_exit_function(fun: Optional[Callable[[], None]] = None, signals: Optional[List[int]] = None):
+    """Register a cleanup function to run on normal exit and optionally on signals.
+
+    Usage:
+      register_exit_function(my_cleanup)
+      register_exit_function(my_cleanup, signals=[signal.SIGINT, signal.SIGTERM])
+
+    Can also be used as a decorator: `@register_exit_function()`
+    """
+    global _atexit_registered
+
+    def run_cleanup():
+        for f in list(_registered_cleanup):
             try:
-                fun()
-            finally:
-                _previous_exit_functions.add(fun)
-    def sig_wrap(signum=None, frame=None):
-        ef_wrapper()
-        if signum is not None:
-            sys.exit(signum)
-    def register_fun(fun, signals):
-        if not callable(fun):
-            raise TypeError(f'{getattr(fun, '__name__', 'Unknown')} is not callable')
-        set([fun])
-        if len(signals) == 0:
-            signals = get_all_signals()
-        signals = set(signals)
-        for sig in signals:
-            old_handler = signal.signal(sig, sig_wrap)
-            if old_handler not in (signal.SIG_DFL, signal.SIG_IGN):
-                if not callable(old_handler):
-                    continue
-                if (sig == signal.SIGINT and
-                        old_handler is signal.default_int_handler):
-                    continue
-                if old_handler not in _exit_functions:
-                    atexit.register(old_handler)
-                    _exit_functions.add(old_handler)
-        if fun not in _exit_functions or not signals:
-            atexit.register(ef_wrapper)
-            _exit_functions.add(fun)
+                f()
+            except Exception:
+                logging.exception('Error running cleanup function')
+
+    def ensure_atexit():
+        global _atexit_registered
+        if not _atexit_registered:
+            atexit.register(run_cleanup)
+            _atexit_registered = True
+
+    def add_and_register(fun_to_add: Callable[[], None], sigs: Optional[List[int]]):
+        if not callable(fun_to_add):
+            raise TypeError(f'{getattr(fun_to_add, "__name__", "Unknown")} is not callable')
+        if fun_to_add not in _registered_cleanup:
+            _registered_cleanup.append(fun_to_add)
+        ensure_atexit()
+        if sigs:
+            for sig in sigs:
+                old = signal.getsignal(sig)
+
+                def handler(signum, frame, old=old):
+                    # Avoid performing potentially blocking cleanup inside the
+                    # signal handler. Rely on the atexit-registered
+                    # `run_cleanup` to run on normal process exit.
+                    if callable(old) and old not in (signal.SIG_DFL, signal.SIG_IGN):
+                        try:
+                            old(signum, frame)
+                        except Exception:
+                            logging.exception('Previous signal handler raised')
+                    # Raise SystemExit to trigger atexit handlers.
+                    sys.exit(signum)
+
+                signal.signal(sig, handler)
+
     if fun is None:
-        @functools.wraps
-        def outer(fun):
-            return register_fun(fun, signals)
-        return outer
+        def decorator(f):
+            add_and_register(f, signals)
+            return f
+
+        return decorator
     else:
-        register_fun(fun, signals)
+        add_and_register(fun, signals)
         return fun
 
 
 class close_reasons(Enum):
+    """Reason codes used when requesting an existing inhibitor to close.
+
+    The enum values are sent across the local socket so the running
+    instance knows why it was asked to terminate.
+    """
     CLOSE_REQUESTED = 1
     NEW_INSTANCE = 2
     SIGNAL_RECEIVED = 3
@@ -94,6 +116,14 @@ class close_reasons(Enum):
     TERM = 5
 
     def get_string(reason:close_reasons):
+        """Return a human-readable string for a `close_reasons` value.
+
+        Args:
+            reason: `close_reasons` enum value.
+
+        Returns:
+            A short description string.
+        """
         match reason:
             case close_reasons.CLOSE_REQUESTED:
                 return "User requested closure"
@@ -109,32 +139,57 @@ class close_reasons(Enum):
                 raise ValueError('Unknown value')
 
 class power_management_inhibitor:
+    """Helper to interact with the session power management D-Bus API.
+
+    The implementation calls `Inhibit` and `UnInhibit` on the
+    `org.freedesktop.PowerManagement` object path used by some desktop
+    environments to control idle inhibition.
+    """
     def __init__(self):
         bus = dbus.SessionBus()
         self.power_management_proxy = bus.get_object(
             "org.freedesktop.PowerManagement", "/org/freedesktop/PowerManagement"
         )
-        pass
     
     def start_inhibit(self, inhibitor: str, reason: str):
-        """Start locking sleep and screen locking
+        """Request an inhibition and return a cookie.
 
         Args:
-            inhibitor (str): App or desktop entry name
-            reason (str): Reason to block
+            inhibitor: Application or desktop entry name shown to the session.
+            reason: Short text describing why the inhibition is requested.
+
+        Returns:
+            The inhibitor cookie (opaque integer) or None on failure.
         """
-        
-        cookie = self.power_management_proxy.Inhibit(inhibitor, reason)
-        logging.info("Blocking sleep and screen locking")
-        logging.info(f'By: {inhibitor}')
-        logging.info(f'Reason: {reason}')
-        return cookie
+        try:
+            cookie = self.power_management_proxy.Inhibit(inhibitor, reason)
+            logging.info("Blocking sleep and screen locking")
+            logging.info(f'By: {inhibitor}')
+            logging.info(f'Reason: {reason}')
+            return cookie
+        except Exception:
+            logging.exception('Failed to acquire inhibition via D-Bus')
+            return None
 
     def stop_inhibit(self, cookie: dbus.UInt32):
-        self.power_management_proxy.UnInhibit(cookie)
-        logging.info("Releasing sleep and screen locking block")
+        """Release a previously acquired inhibitor cookie.
+
+        Args:
+            cookie: The inhibitor cookie returned by `Inhibit`.
+        """
+        try:
+            self.power_management_proxy.UnInhibit(cookie)
+            logging.info("Releasing sleep and screen locking block")
+        except Exception:
+            logging.exception('Failed to release inhibitor cookie')
     
 def close_existing(address, reason:close_reasons):
+    """Ask a running instance (if any) to close the inhibitor.
+
+    The function connects to a local `multiprocessing.connection` socket
+    and sends a `close` command followed by the numeric reason code.
+    If no listener is present the call is silently ignored.
+    """
     try:
         conn = Client(*address)
         conn.send("close")
@@ -144,30 +199,51 @@ def close_existing(address, reason:close_reasons):
         return
 
 def listen_for_close(address, release_attempted=False):
+    """Block and listen on the socket for a close request.
+
+    When a `CLOSE` message is received the numeric reason is read and
+    the function returns allowing cleanup to occur. If the socket path
+    is stale the first attempt will remove it and retry once.
+    """
     try:
         listener = Listener(*address)
         conn = listener.accept()
         while True:
             msg = conn.recv()
             if msg.upper() == 'CLOSE':
-                time.sleep(0.05) #For santity's sake a tiny pause to ensure that the reason has been transmitted
+                # small pause to ensure the reason integer is transmitted
+                time.sleep(0.05)
                 reason = conn.recv()
                 break
             logging.info(f'Closing due to {close_reasons.get_string(reason)}')
         conn.close()
-    except socket.error as e:
+    except OSError as e:
         if release_attempted == False:
             logging.info('Clearing existing socket')
             release_socket(address[0])
-            listen_for_close(True)
+            listen_for_close(address, True)
         else:
             raise e
         
 
 def release_socket(path):
-    os.remove(path)
+    """Remove the socket file at `path` if it exists.
+
+    This is used to clean up stale UNIX domain socket files left by
+    previous runs.
+    """
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        logging.exception('Failed to remove socket file')
 
 def get_socket_cleaner(socket_address, sig):
+    """Return a callable that requests a close for a given signal.
+
+    The returned function maps common signals to `close_reasons` and
+    asks a running instance to terminate the inhibitor.
+    """
     def socket_cleaner():
         match sig:
             case signal.SIGINT:
@@ -180,36 +256,52 @@ def get_socket_cleaner(socket_address, sig):
     return socket_cleaner
 
 def get_cleanup_function(pm_bus: power_management_inhibitor, cookie: dbus.UInt32):
+    """Return a cleanup callable that releases the inhibitor cookie.
+
+    This is suitable for registering with `register_exit_function` or
+    `atexit.register` to ensure the inhibitor is released on exit.
+    """
     def cleanup():
         pm_bus.stop_inhibit(cookie)
     return cleanup
 
 if __name__ == '__main__':
-    logging.root.setLevel(logging.DEBUG)
-    
+    logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s', level=logging.INFO)
+
     p = argparse.ArgumentParser()
     p.description = "Programatically block screen lock and sleep on linux, specifically KDE plasma"
 
     p.add_argument("--release", help="Does not block screen lock, instead releasing any existing manual blocks", action='store_true')
+    p.add_argument("--verbose", "-v", help="Enable verbose (debug) logging", action='store_true')
     p.add_argument("inhibitor", help="App, or desktop entry name", type=str, nargs='?', default="User")
-    p.add_argument("reason", help="Reaon to block", type=str, nargs='?', default="Manually enabled")
+    p.add_argument("reason", help="Reason to block", type=str, nargs='?', default="Manually enabled")
     args = p.parse_args()
-    
-    
-    address = (os.path.join(tempfile.gettempdir(), f'{os.path.basename(__file__)}.socket'), 'AF_UNIX')
-    register_exit_function(get_socket_cleaner(address, signal.SIGINT), [signal.SIGINT])
-    register_exit_function(get_socket_cleaner(address, signal.SIGTERM), [signal.SIGTERM])
-    # OtherSignals = get_all_signals()
-    # OtherSignals.remove(signal.SIGINT)
-    # OtherSignals.remove(signal.SIGTERM)
-    # register_exit_function(get_socket_cleaner(address, False), OtherSignals)
-    
-    if args.release == True:
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    socket_path = os.path.join(tempfile.gettempdir(), f'{os.path.basename(__file__)}-{os.getuid()}.socket')
+    address = (socket_path, 'AF_UNIX')
+
+    # Ensure socket file cleanup handlers are registered for common signals
+    register_exit_function(get_socket_cleaner(address, signal.SIGINT), signals=[signal.SIGINT])
+    register_exit_function(get_socket_cleaner(address, signal.SIGTERM), signals=[signal.SIGTERM])
+
+    if args.release:
         close_existing(address, close_reasons.CLOSE_REQUESTED)
-        exit()
-    
+        sys.exit(0)
+
+    # Ask any existing instance to exit (makes this run in toggle-style)
     close_existing(address, close_reasons.NEW_INSTANCE)
-    pm_bus = power_management_inhibitor()
-    block_cookie = pm_bus.start_inhibit(inhibitor=args.inhibitor, reason=args.reason)
+
+    inhibitor = power_management_inhibitor()
+    cookie = inhibitor.start_inhibit(inhibitor=args.inhibitor, reason=args.reason)
+
+    if cookie is None:
+        logging.error('Could not acquire inhibitor; exiting')
+        sys.exit(1)
+
+    # Ensure we release cookie on exit
+    register_exit_function(get_cleanup_function(inhibitor, cookie))
+
     listen_for_close(address)
-    register_exit_function(get_cleanup_function(pm_bus, block_cookie))
