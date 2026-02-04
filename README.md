@@ -102,4 +102,39 @@ License: See the `LICENSE` file in this repository.
 
 - **Luis Bocanegra** - original author and maintainer
 - **Contributors & contributors list** - thank you to anyone who filed issues, suggested improvements, or contributed patches. If you'd like your name listed here, open a pull request or an issue and I'll add you.
+
+## Caffeine (tray) — GUI controller
+
+This repository includes a small system tray application, "Caffeine", that
+controls `pause-auto-sleep` from the KDE/Qt system tray. It ships as
+`caffeine.py` and provides a wrapper `run-caffeine.sh` and a
+desktop autostart entry in `desktop/caffeine-tray.desktop`.
+
+Usage examples:
+
+```sh
+# run the tray app
+./run-caffeine.sh
+
+# autostart: copy the desktop file to your autostart folder
+mkdir -p ~/.config/autostart
+cp desktop/caffeine-tray.desktop ~/.config/autostart/
+```
+
+Customization:
+- To set a custom application identifier and reason (displayed by the
+  session UI), export `PAUSE_INHIBITOR` and `PAUSE_REASON` before
+  launching the tray app. Example:
+
+```sh
+export PAUSE_INHIBITOR="org.kde.konsole"
+export PAUSE_REASON="Watching a long task"
+./run-caffeine.sh
+```
+
+Icons:
+- Example SVG icons are provided in `icons/caffeine-on.svg` and
+  `icons/caffeine-off.svg`. The tray app prefers these bundled SVGs but
+  will fall back to the desktop theme icons if they are missing.
+
   - **DelphicOkami** - Updated applet for use with KDE 6 

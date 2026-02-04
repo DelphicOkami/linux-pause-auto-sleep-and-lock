@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Pause Auto Sleep Tray
+Comment=Toggle pause-auto-sleep from system tray
+Exec=/home/delphicokami/Projects/linux-pause-auto-sleep-and-lock/run-tray.sh
+Icon=pause-auto-sleep-on
+Terminal=false
+Categories=Utility;Application;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
