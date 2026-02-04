@@ -24,93 +24,192 @@
 # If the script is run a second time,
 # it will look for existing inhibitor process and stop it, ending the inhibition
 
-import subprocess
-import dbus
+import atexit
+import functools
 import sys
+import dbus
+import tempfile
 import os
 import signal
 import logging
+import time
+import argparse
+from multiprocessing.connection import Listener, Client
+import socket
+from enum import Enum
 
-logging.root.setLevel(logging.DEBUG)
+_exit_functions = set()
+_previous_exit_functions = set()
 
+def get_all_signals():
+    return [signal.SIGINT, signal.SIGTERM, signal.SIGTRAP, signal.SIGABRT, signal.SIGBUS, signal.SIGALRM]
 
-def exit_message(sig, frame):
-    logging.info("Inhibition stopped bye!")
-    sys.exit(0)
-
-
-def get_instance_pid():
-    """Get pid of active inhibition instance
-
-    Returns:
-        str: PID, empty if not found
-    """
-    home_dir = os.path.expanduser("~")
-    location = os.path.join(home_dir, ".local/bin/pause-auto-sleep")
-    if location != sys.argv[0]:
-        logging.error(
-            f"Script is not in/wasn't run from correct location\n"
-            + f"Current command:\n{sys.argv[0]}\n"
-            + f"Expected command\n{location} OR pause-auto-sleep"
-        )
-        exit(1)
-    logging.debug(f"script location: {location}")
-    pid = ""
-    try:
-        pid = subprocess.check_output(
-            "ps -e -f | grep " + location + "$ | head -n1 | awk '{print $2}'",
-            shell=True,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-        ).strip()
-    except subprocess.CalledProcessError as e:
-        logging.error(e.output)
-    finally:
-        return pid
-
-
-def kill_existing(pid):
-    """Kill process by its PID
-
-    Args:
-        pid (str): PID
-    """
-    logging.warning(f"Found previous inhibition process with PID: '{pid}' killing...")
-    subprocess.Popen("kill -9 " + str(pid), shell=True)
-
-
-def set_inhibit(inhibitor: str, reason: str):
-    """Start locking sleep and screen locking
-
-    Args:
-        inhibitor (str): App or desktop entry name
-        reason (str): Reason to block
-    """
-    bus = dbus.SessionBus()
-    proxy = bus.get_object(
-        "org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver"
-    )
-    iface = dbus.Interface(proxy, "org.freedesktop.ScreenSaver")
-
-    iface.Inhibit(inhibitor, reason)
-    logging.info("Blocking sleep and screen locking (pid: %d)" % os.getpid())
-    logging.info("By: %s" % inhibitor)
-    logging.info("Reason: %s" % reason)
-
-
-last_pid = get_instance_pid()
-current_pid = str(os.getpid())
-logging.debug(f"existing: {last_pid}  current: {current_pid}")
-logging.debug(f"args: {sys.argv[1:]}")
-# kill existing if exists when there's no arguments
-if last_pid != current_pid and len(sys.argv) < 2:
-    kill_existing(last_pid)
-else:
-    if len(sys.argv) > 1:
-        inhibitor, reason = " ".join(sys.argv[1:2]), " ".join(sys.argv[2:])
+def register_exit_function(fun: callable, signals=[]):
+    def ef_wrapper():
+        if fun not in _previous_exit_functions:
+            try:
+                fun()
+            finally:
+                _previous_exit_functions.add(fun)
+    def sig_wrap(signum=None, frame=None):
+        ef_wrapper()
+        if signum is not None:
+            sys.exit(signum)
+    def register_fun(fun, signals):
+        if not callable(fun):
+            raise TypeError(f'{getattr(fun, '__name__', 'Unknown')} is not callable')
+        set([fun])
+        if len(signals) == 0:
+            signals = get_all_signals()
+        signals = set(signals)
+        for sig in signals:
+            old_handler = signal.signal(sig, sig_wrap)
+            if old_handler not in (signal.SIG_DFL, signal.SIG_IGN):
+                if not callable(old_handler):
+                    continue
+                if (sig == signal.SIGINT and
+                        old_handler is signal.default_int_handler):
+                    continue
+                if old_handler not in _exit_functions:
+                    atexit.register(old_handler)
+                    _exit_functions.add(old_handler)
+        if fun not in _exit_functions or not signals:
+            atexit.register(ef_wrapper)
+            _exit_functions.add(fun)
+    if fun is None:
+        @functools.wraps
+        def outer(fun):
+            return register_fun(fun, signals)
+        return outer
     else:
-        inhibitor, reason = "User", "Manually enabled"
-    set_inhibit(inhibitor, reason)
-    # Wait until termination
-    signal.signal(signal.SIGINT, exit_message)
-    signal.pause()
+        register_fun(fun, signals)
+        return fun
+
+
+class close_reasons(Enum):
+    CLOSE_REQUESTED = 1
+    NEW_INSTANCE = 2
+    SIGNAL_RECEIVED = 3
+    CTRL_C = 4
+    TERM = 5
+
+    def get_string(reason:close_reasons):
+        match reason:
+            case close_reasons.CLOSE_REQUESTED:
+                return "User requested closure"
+            case close_reasons.NEW_INSTANCE:
+                return "New instance started"
+            case close_reasons.SIGNAL_RECEIVED:
+                return "Signal received"
+            case close_reasons.CTRL_C:
+                return "Ctrl + c caught"
+            case close_reasons.TERM:
+                return "Terminate signal caught"
+            case _:
+                raise ValueError('Unknown value')
+
+class power_management_inhibitor:
+    def __init__(self):
+        bus = dbus.SessionBus()
+        self.power_management_proxy = bus.get_object(
+            "org.freedesktop.PowerManagement", "/org/freedesktop/PowerManagement"
+        )
+        pass
+    
+    def start_inhibit(self, inhibitor: str, reason: str):
+        """Start locking sleep and screen locking
+
+        Args:
+            inhibitor (str): App or desktop entry name
+            reason (str): Reason to block
+        """
+        
+        cookie = self.power_management_proxy.Inhibit(inhibitor, reason)
+        logging.info("Blocking sleep and screen locking")
+        logging.info(f'By: {inhibitor}')
+        logging.info(f'Reason: {reason}')
+        return cookie
+
+    def stop_inhibit(self, cookie: dbus.UInt32):
+        self.power_management_proxy.UnInhibit(cookie)
+        logging.info("Releasing sleep and screen locking block")
+    
+def close_existing(address, reason:close_reasons):
+    try:
+        conn = Client(*address)
+        conn.send("close")
+        conn.send(reason.value)
+        conn.close()
+    except socket.error:
+        return
+
+def listen_for_close(address, release_attempted=False):
+    try:
+        listener = Listener(*address)
+        conn = listener.accept()
+        while True:
+            msg = conn.recv()
+            if msg.upper() == 'CLOSE':
+                time.sleep(0.05) #For santity's sake a tiny pause to ensure that the reason has been transmitted
+                reason = conn.recv()
+                break
+            logging.info(f'Closing due to {close_reasons.get_string(reason)}')
+        conn.close()
+    except socket.error as e:
+        if release_attempted == False:
+            logging.info('Clearing existing socket')
+            release_socket(address[0])
+            listen_for_close(True)
+        else:
+            raise e
+        
+
+def release_socket(path):
+    os.remove(path)
+
+def get_socket_cleaner(socket_address, sig):
+    def socket_cleaner():
+        match sig:
+            case signal.SIGINT:
+                reason = close_reasons.CTRL_C
+            case signal.SIGTERM:
+                reason = close_reasons.TERM
+            case _:
+                reason = close_reasons.SIGNAL_RECEIVED
+        close_existing(socket_address, reason)
+    return socket_cleaner
+
+def get_cleanup_function(pm_bus: power_management_inhibitor, cookie: dbus.UInt32):
+    def cleanup():
+        pm_bus.stop_inhibit(cookie)
+    return cleanup
+
+if __name__ == '__main__':
+    logging.root.setLevel(logging.DEBUG)
+    
+    p = argparse.ArgumentParser()
+    p.description = "Programatically block screen lock and sleep on linux, specifically KDE plasma"
+
+    p.add_argument("--release", help="Does not block screen lock, instead releasing any existing manual blocks", action='store_true')
+    p.add_argument("inhibitor", help="App, or desktop entry name", type=str, nargs='?', default="User")
+    p.add_argument("reason", help="Reaon to block", type=str, nargs='?', default="Manually enabled")
+    args = p.parse_args()
+    
+    
+    address = (os.path.join(tempfile.gettempdir(), f'{os.path.basename(__file__)}.socket'), 'AF_UNIX')
+    register_exit_function(get_socket_cleaner(address, signal.SIGINT), [signal.SIGINT])
+    register_exit_function(get_socket_cleaner(address, signal.SIGTERM), [signal.SIGTERM])
+    # OtherSignals = get_all_signals()
+    # OtherSignals.remove(signal.SIGINT)
+    # OtherSignals.remove(signal.SIGTERM)
+    # register_exit_function(get_socket_cleaner(address, False), OtherSignals)
+    
+    if args.release == True:
+        close_existing(address, close_reasons.CLOSE_REQUESTED)
+        exit()
+    
+    close_existing(address, close_reasons.NEW_INSTANCE)
+    pm_bus = power_management_inhibitor()
+    block_cookie = pm_bus.start_inhibit(inhibitor=args.inhibitor, reason=args.reason)
+    listen_for_close(address)
+    register_exit_function(get_cleanup_function(pm_bus, block_cookie))
