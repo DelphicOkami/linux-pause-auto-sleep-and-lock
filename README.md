@@ -14,7 +14,7 @@ Manually block automatic suspend and screen locking from the command line or a k
 - D-Bus Python bindings (package name varies by distro; e.g. `python3-dbus`)
 
 ## Installation
-
+### pause-auto-sleep only
 Clone or download this repository, then install the script into a directory on your PATH (example uses `~/.local/bin`):
 
 ```sh
@@ -24,6 +24,63 @@ chmod u+x ~/.local/bin/pause-auto-sleep
 ```
 
 If you prefer, use `/usr/local/bin` or a system-wide location (requires sudo).
+
+### Caffeine (tray) — KDE 6 GUI controller
+
+This repository includes a small system tray application, "Caffeine", that
+controls `pause-auto-sleep` from the KDE/Qt system tray. It ships as
+`caffeine.py` and provides a wrapper `run-caffeine.sh` and a
+desktop autostart entry in `desktop/caffeine-tray.desktop`.
+
+```sh
+# install the app files to a central user location (recommended)
+mkdir -p ~/.local/share/caffeine
+cp run-caffeine.sh ~/.local/share/caffeine/run-caffeine.sh
+cp caffeine.py ~/.local/share/caffeine/caffeine.py
+cp -r icons ~/.local/share/caffeine/icons
+cp desktop/caffeine-tray.desktop ~/.local/share/caffeine/
+chmod u+x ~/.local/share/caffeine/run-caffeine.sh
+
+# Also install the `pause-auto-sleep` script so the tray app can control it.
+# You can either place it alongside the other app files, or install it to
+# a directory on your PATH such as `~/.local/bin`.
+cp pause-auto-sleep ~/.local/share/caffeine/pause-auto-sleep
+chmod u+x ~/.local/share/caffeine/pause-auto-sleep
+
+# To make the icons available to the whole desktop (so `QIcon.fromTheme` finds them) install them into the hicolor icon theme:
+mkdir -p ~/.local/share/icons/hicolor/scalable/apps
+ln -sf ~/.local/share/caffeine/icons/caffeine-on.svg ~/.local/share/icons/hicolor/scalable/apps/caffeine-on.svg
+ln -sf ~/.local/share/caffeine/icons/caffeine-off.svg ~/.local/share/icons/hicolor/scalable/apps/caffeine-off.svg
+
+# install the desktop file into the per-user applications directory, then enable autostart via a symlink
+mkdir -p ~/.local/share/applications
+cp ~/.local/share/caffeine/caffeine-tray.desktop ~/.local/share/applications/caffeine-tray.desktop
+
+
+# create a symlink for autostart (desktop files in ~/.config/autostart that point into applications are preferred)
+mkdir -p ~/.config/autostart
+ln -sf ~/.local/share/applications/caffeine-tray.desktop ~/.config/autostart/caffeine-tray.desktop
+
+# run the tray app via the installed wrapper
+~/.local/share/caffeine/run-caffeine.sh
+```
+
+Customization:
+- To set a custom application identifier and reason (displayed by the
+  session UI), export `PAUSE_INHIBITOR` and `PAUSE_REASON` before
+  launching the tray app. Example:
+
+```sh
+export PAUSE_INHIBITOR="org.kde.konsole"
+export PAUSE_REASON="Watching a long task"
+./run-caffeine.sh
+```
+
+Icons:
+- Example SVG icons are provided in `icons/caffeine-on.svg` and
+  `icons/caffeine-off.svg`. The tray app prefers these bundled SVGs but
+  will fall back to the desktop theme icons if they are missing.
+  
 
 ## Usage
 
@@ -87,41 +144,6 @@ Restart=on-failure
 [Install]
 WantedBy=default.target
 ```
-
-## Caffeine (tray) — KDE 6 GUI controller
-
-This repository includes a small system tray application, "Caffeine", that
-controls `pause-auto-sleep` from the KDE/Qt system tray. It ships as
-`caffeine.py` and provides a wrapper `run-caffeine.sh` and a
-desktop autostart entry in `desktop/caffeine-tray.desktop`.
-
-Usage examples:
-
-```sh
-# run the tray app
-./run-caffeine.sh
-
-# autostart: copy the desktop file to your autostart folder
-mkdir -p ~/.config/autostart
-cp desktop/caffeine-tray.desktop ~/.config/autostart/
-```
-
-Customization:
-- To set a custom application identifier and reason (displayed by the
-  session UI), export `PAUSE_INHIBITOR` and `PAUSE_REASON` before
-  launching the tray app. Example:
-
-```sh
-export PAUSE_INHIBITOR="org.kde.konsole"
-export PAUSE_REASON="Watching a long task"
-./run-caffeine.sh
-```
-
-Icons:
-- Example SVG icons are provided in `icons/caffeine-on.svg` and
-  `icons/caffeine-off.svg`. The tray app prefers these bundled SVGs but
-  will fall back to the desktop theme icons if they are missing.
-
 
 
 ## Troubleshooting

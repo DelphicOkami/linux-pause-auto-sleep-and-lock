@@ -1,9 +1,10 @@
 [Desktop Entry]
 Type=Application
+Categories=Utilities
 Version=1.0
-Name=Caffeine (pause-auto-sleep)
+Name=Caffeine
 Comment=Tray app to toggle pause-auto-sleep (keep system awake)
-Exec=/home/delphicokami/Projects/linux-pause-auto-sleep-and-lock/run-caffeine.sh
+Exec=sh -c 'exec "/home/delphicokami/.local/share/caffeine/run-caffeine.sh"'
 Icon=caffeine-on
 Terminal=false
 Categories=Utility;Application;

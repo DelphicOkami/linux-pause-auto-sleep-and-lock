@@ -34,13 +34,29 @@ def find_script() -> str | None:
     otherwise `None`.
     """
     name = 'pause-auto-sleep'
+    # 1) prefer PATH
     path = shutil.which(name)
     if path:
         return path
+
+    # 2) prefer an XDG installation under $XDG_DATA_HOME/caffeine
+    xdg_data = os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share'))
+    candidate = os.path.join(xdg_data, 'caffeine', name)
+    if os.path.exists(candidate):
+        return candidate
+
+    # 3) check ~/.local/bin
+    local_bin = os.path.expanduser('~/.local/bin')
+    candidate = os.path.join(local_bin, name)
+    if os.path.exists(candidate):
+        return candidate
+
+    # 4) fallback to script-next-to-this-file (useful during development)
     here = os.path.dirname(__file__)
     candidate = os.path.join(here, name)
-    if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+    if os.path.exists(candidate):
         return candidate
+
     return None
 
 
@@ -88,11 +104,21 @@ class CaffeineApp(QtWidgets.QApplication):
         icon_dir = os.path.join(os.path.dirname(__file__), 'icons')
         icon_on_path = os.path.join(icon_dir, 'caffeine-on.svg')
         icon_off_path = os.path.join(icon_dir, 'caffeine-off.svg')
-        if os.path.exists(icon_on_path):
+
+        # Prefer theme icons (so centrally-installed icons are used),
+        # then bundled SVGs, then generic themed icons.
+        theme_on = QtGui.QIcon.fromTheme('caffeine-on')
+        theme_off = QtGui.QIcon.fromTheme('caffeine-off')
+        if not theme_on.isNull():
+            self.icon_on = theme_on
+        elif os.path.exists(icon_on_path):
             self.icon_on = QtGui.QIcon(icon_on_path)
         else:
             self.icon_on = QtGui.QIcon.fromTheme('media-playback-pause')
-        if os.path.exists(icon_off_path):
+
+        if not theme_off.isNull():
+            self.icon_off = theme_off
+        elif os.path.exists(icon_off_path):
             self.icon_off = QtGui.QIcon(icon_off_path)
         else:
             self.icon_off = QtGui.QIcon.fromTheme('media-playback-start')

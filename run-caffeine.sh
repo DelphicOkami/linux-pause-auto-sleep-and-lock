@@ -9,11 +9,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -n "${CAFFEINE_PY:-}" ]; then
   CAFFEINE_PY_PATH="$CAFFEINE_PY"
 else
-  if [ -x "$SCRIPT_DIR/caffeine.py" ]; then
+  if [ -f "$SCRIPT_DIR/caffeine.py" ]; then
     CAFFEINE_PY_PATH="$SCRIPT_DIR/caffeine.py"
-  elif [ -x "$SCRIPT_DIR/../caffeine.py" ]; then
+  elif [ -f "$SCRIPT_DIR/../caffeine.py" ]; then
     CAFFEINE_PY_PATH="$SCRIPT_DIR/../caffeine.py"
-  elif [ -x "./caffeine.py" ]; then
+  elif [ -f "./caffeine.py" ]; then
     CAFFEINE_PY_PATH="$(pwd)/caffeine.py"
   else
     echo "Could not find caffeine.py; set CAFFEINE_PY to its path" >&2
