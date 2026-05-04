@@ -10,6 +10,7 @@ Dependencies: PySide6 or PyQt6 (Qt6), python3
 Usage: run this file (optionally autostart it via KDE autostart/.desktop)
 """
 import os
+import socket
 import sys
 import stat
 import shutil
@@ -73,18 +74,35 @@ def socket_path_for_script() -> str:
 def is_paused() -> bool:
     """Detect whether the inhibitor is currently active.
 
-    This checks for the presence of a UNIX socket file created by
-    `pause-auto-sleep`. It is a best-effort check suitable for the
-    tray app's UI state.
+    Verifies a `pause-auto-sleep` instance is actually listening on its
+    UNIX socket. If the socket file exists but no process is accepting
+    connections (stale socket from a crashed/killed instance), it is
+    removed so subsequent toggles start a fresh inhibitor.
     """
     path = socket_path_for_script()
     try:
         st = os.stat(path)
-        return stat.S_ISSOCK(st.st_mode)
     except FileNotFoundError:
         return False
     except Exception:
         return False
+
+    if not stat.S_ISSOCK(st.st_mode):
+        return False
+
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.2)
+    try:
+        s.connect(path)
+        return True
+    except (ConnectionRefusedError, socket.timeout, OSError):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return False
+    finally:
+        s.close()
 
 
 class CaffeineApp(QtWidgets.QApplication):

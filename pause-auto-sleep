@@ -139,18 +139,29 @@ class close_reasons(Enum):
                 raise ValueError('Unknown value')
 
 class power_management_inhibitor:
-    """Helper to interact with the session power management D-Bus API.
+    """Helper to interact with KDE's Solid PolicyAgent D-Bus API.
 
-    The implementation calls `Inhibit` and `UnInhibit` on the
-    `org.freedesktop.PowerManagement` object path used by some desktop
-    environments to control idle inhibition.
+    Uses `org.kde.Solid.PowerManagement.PolicyAgent.AddInhibition` so that
+    inhibitions are tracked against this process's bus name and released
+    automatically by KDE if the process dies before calling
+    `ReleaseInhibition`. The freedesktop proxy
+    (`org.freedesktop.PowerManagement.Inhibit`) does not always do this
+    cleanly, which historically left zombie inhibitions in the session.
     """
+
+    # KDE PolicyAgent RequiredPolicy bitmask: InterruptSession (1) blocks
+    # automatic suspend and screen locking; ChangeProfile (2) blocks the
+    # power-saving profile from kicking in. Together they match the
+    # behavior the freedesktop proxy used to give us.
+    _POLICY_TYPES = 1 | 2
+
     def __init__(self):
         bus = dbus.SessionBus()
-        self.power_management_proxy = bus.get_object(
-            "org.freedesktop.PowerManagement", "/org/freedesktop/PowerManagement"
+        self.policy_agent = bus.get_object(
+            'org.kde.Solid.PowerManagement.PolicyAgent',
+            '/org/kde/Solid/PowerManagement/PolicyAgent',
         )
-    
+
     def start_inhibit(self, inhibitor: str, reason: str):
         """Request an inhibition and return a cookie.
 
@@ -162,8 +173,11 @@ class power_management_inhibitor:
             The inhibitor cookie (opaque integer) or None on failure.
         """
         try:
-            cookie = self.power_management_proxy.Inhibit(inhibitor, reason)
-            logging.info("Blocking sleep and screen locking")
+            cookie = self.policy_agent.AddInhibition(
+                dbus.UInt32(self._POLICY_TYPES), inhibitor, reason,
+                dbus_interface='org.kde.Solid.PowerManagement.PolicyAgent',
+            )
+            logging.info('Blocking sleep and screen locking')
             logging.info(f'By: {inhibitor}')
             logging.info(f'Reason: {reason}')
             return cookie
@@ -175,11 +189,14 @@ class power_management_inhibitor:
         """Release a previously acquired inhibitor cookie.
 
         Args:
-            cookie: The inhibitor cookie returned by `Inhibit`.
+            cookie: The inhibitor cookie returned by `AddInhibition`.
         """
         try:
-            self.power_management_proxy.UnInhibit(cookie)
-            logging.info("Releasing sleep and screen locking block")
+            self.policy_agent.ReleaseInhibition(
+                cookie,
+                dbus_interface='org.kde.Solid.PowerManagement.PolicyAgent',
+            )
+            logging.info('Releasing sleep and screen locking block')
         except Exception:
             logging.exception('Failed to release inhibitor cookie')
     
@@ -272,6 +289,7 @@ if __name__ == '__main__':
     p.description = "Programatically block screen lock and sleep on linux, specifically KDE plasma"
 
     p.add_argument("--release", help="Does not block screen lock, instead releasing any existing manual blocks", action='store_true')
+    p.add_argument("--list", help="Print active inhibitors (app: reason) and exit", action='store_true', dest='list_inhibitors')
     p.add_argument("--verbose", "-v", help="Enable verbose (debug) logging", action='store_true')
     p.add_argument("inhibitor", help="App, or desktop entry name", type=str, nargs='?', default="User")
     p.add_argument("reason", help="Reason to block", type=str, nargs='?', default="Manually enabled")
@@ -286,6 +304,24 @@ if __name__ == '__main__':
     # Ensure socket file cleanup handlers are registered for common signals
     register_exit_function(get_socket_cleaner(address, signal.SIGINT), signals=[signal.SIGINT])
     register_exit_function(get_socket_cleaner(address, signal.SIGTERM), signals=[signal.SIGTERM])
+
+    if args.list_inhibitors:
+        try:
+            bus = dbus.SessionBus()
+            agent = bus.get_object('org.kde.Solid.PowerManagement.PolicyAgent',
+                                   '/org/kde/Solid/PowerManagement/PolicyAgent')
+            inhibitions = agent.ListInhibitions(
+                dbus_interface='org.kde.Solid.PowerManagement.PolicyAgent')
+        except dbus.exceptions.DBusException as e:
+            print(f'Error querying PolicyAgent: {e}', file=sys.stderr)
+            sys.exit(1)
+
+        if not inhibitions:
+            print('No active inhibitors found.')
+            sys.exit(0)
+        for app, reason in inhibitions:
+            print(f'{app}: {reason}')
+        sys.exit(0)
 
     if args.release:
         close_existing(address, close_reasons.CLOSE_REQUESTED)
