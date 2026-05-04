@@ -10,7 +10,6 @@ Dependencies: PySide6 or PyQt6 (Qt6), python3
 Usage: run this file (optionally autostart it via KDE autostart/.desktop)
 """
 import os
-import socket
 import sys
 import stat
 import shutil
@@ -71,6 +70,27 @@ def socket_path_for_script() -> str:
     return os.path.join(tempfile.gettempdir(), f"{name}-{os.getuid()}.socket")
 
 
+def _has_unix_listener(path: str) -> bool:
+    """Return True if any process is listening on the AF_UNIX socket `path`.
+
+    Reads `/proc/net/unix` rather than connecting, because connecting to a
+    `multiprocessing.connection.Listener` triggers an auth challenge that
+    aborts the listener if the client (us) doesn't respond — which would
+    kill the very inhibitor we're trying to inspect.
+    """
+    try:
+        with open('/proc/net/unix', 'r') as f:
+            next(f, None)  # skip header
+            for line in f:
+                parts = line.split()
+                # columns: Num RefCount Protocol Flags Type St Inode Path
+                if len(parts) >= 8 and parts[7] == path and parts[5] == '01':
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def is_paused() -> bool:
     """Detect whether the inhibitor is currently active.
 
@@ -90,19 +110,14 @@ def is_paused() -> bool:
     if not stat.S_ISSOCK(st.st_mode):
         return False
 
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(0.2)
-    try:
-        s.connect(path)
+    if _has_unix_listener(path):
         return True
-    except (ConnectionRefusedError, socket.timeout, OSError):
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-        return False
-    finally:
-        s.close()
+
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return False
 
 
 class CaffeineApp(QtWidgets.QApplication):

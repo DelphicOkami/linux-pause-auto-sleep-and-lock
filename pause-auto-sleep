@@ -36,6 +36,11 @@ from typing import Callable, Optional, List
 _registered_cleanup: List[Callable[[], None]] = []
 _atexit_registered = False
 
+# Capture this at import time so atexit-registered cleanup callables can
+# still resolve it after Python 3.14 begins clearing module globals during
+# interpreter shutdown.
+_SCRIPT_BASENAME = os.path.basename(__file__)
+
 def get_all_signals():
     """Return a list of signals that should trigger cleanup handlers.
 
@@ -76,19 +81,13 @@ def register_exit_function(fun: Optional[Callable[[], None]] = None, signals: Op
         ensure_atexit()
         if sigs:
             for sig in sigs:
-                old = signal.getsignal(sig)
-
-                def handler(signum, frame, old=old):
-                    # Avoid performing potentially blocking cleanup inside the
-                    # signal handler. Rely on the atexit-registered
-                    # `run_cleanup` to run on normal process exit.
-                    if callable(old) and old not in (signal.SIG_DFL, signal.SIG_IGN):
-                        try:
-                            old(signum, frame)
-                        except Exception:
-                            logging.exception('Previous signal handler raised')
-                    # Raise SystemExit to trigger atexit handlers.
-                    sys.exit(signum)
+                def handler(signum, frame):
+                    # Trigger atexit-registered cleanup via SystemExit. We
+                    # deliberately do not chain to the previous handler:
+                    # Python's default SIGINT handler raises
+                    # KeyboardInterrupt, which would escape this signal
+                    # handler and print a confusing traceback.
+                    sys.exit(128 + signum)
 
                 signal.signal(sig, handler)
 
@@ -243,6 +242,84 @@ def listen_for_close(address, release_attempted=False):
             raise e
         
 
+def list_inhibitions():
+    """Return active inhibitions as a list of (app_name, reason) tuples.
+
+    Queries KDE's `org.kde.Solid.PowerManagement.PolicyAgent` directly.
+    Raises `dbus.exceptions.DBusException` on D-Bus failure.
+    """
+    bus = dbus.SessionBus()
+    agent = bus.get_object('org.kde.Solid.PowerManagement.PolicyAgent',
+                           '/org/kde/Solid/PowerManagement/PolicyAgent')
+    raw = agent.ListInhibitions(
+        dbus_interface='org.kde.Solid.PowerManagement.PolicyAgent')
+    return [(str(app), str(reason)) for app, reason in raw]
+
+
+def state_file_path() -> str:
+    """Return the path of the state file describing the running instance."""
+    return os.path.join(
+        tempfile.gettempdir(),
+        f'{_SCRIPT_BASENAME}-{os.getuid()}.state',
+    )
+
+
+def write_state_file(inhibitor: str, reason: str) -> None:
+    """Write the current (inhibitor, reason) so other tools can `--check` it.
+
+    KDE's PolicyAgent does not reliably expose registered inhibitions back
+    via `ListInhibitions` on all Plasma versions, so we keep a small local
+    file describing what this process is currently holding. The file is
+    removed by the `atexit`-registered cleanup on shutdown.
+    """
+    path = state_file_path()
+    tmp = f'{path}.{os.getpid()}.tmp'
+    try:
+        with open(tmp, 'w') as f:
+            f.write(f'{inhibitor}\n{reason}\n')
+        os.replace(tmp, path)
+    except OSError:
+        logging.exception('Failed to write state file')
+
+
+def remove_state_file() -> None:
+    """Remove the state file written by `write_state_file`."""
+    try:
+        os.unlink(state_file_path())
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logging.exception('Failed to remove state file')
+
+
+def read_state_file() -> Optional[tuple]:
+    """Return (inhibitor, reason) from the state file, or None if absent."""
+    try:
+        with open(state_file_path(), 'r') as f:
+            lines = f.read().splitlines()
+        if len(lines) >= 2:
+            return (lines[0], lines[1])
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    return None
+
+
+def is_inhibition_held(inhibitor: str, reason: Optional[str] = None) -> bool:
+    """Return True if this tool is currently holding a matching inhibition.
+
+    Reads the state file written by the running `pause-auto-sleep`
+    instance. Matches `inhibitor` exactly against the app name; if
+    `reason` is not None it must also match exactly.
+    """
+    state = read_state_file()
+    if state is None:
+        return False
+    held_app, held_reason = state
+    return held_app == inhibitor and (reason is None or held_reason == reason)
+
+
 def release_socket(path):
     """Remove the socket file at `path` if it exists.
 
@@ -290,15 +367,24 @@ if __name__ == '__main__':
 
     p.add_argument("--release", help="Does not block screen lock, instead releasing any existing manual blocks", action='store_true')
     p.add_argument("--list", help="Print active inhibitors (app: reason) and exit", action='store_true', dest='list_inhibitors')
+    p.add_argument("--check", help="Exit 0 if an inhibition matching the given inhibitor (and optional reason) is held, else exit 1", action='store_true', dest='check_inhibitor')
     p.add_argument("--verbose", "-v", help="Enable verbose (debug) logging", action='store_true')
-    p.add_argument("inhibitor", help="App, or desktop entry name", type=str, nargs='?', default="User")
-    p.add_argument("reason", help="Reason to block", type=str, nargs='?', default="Manually enabled")
+    p.add_argument("inhibitor", help="App, or desktop entry name", type=str, nargs='?', default=None)
+    p.add_argument("reason", help="Reason to block", type=str, nargs='?', default=None)
     args = p.parse_args()
+
+    # Apply defaults for the inhibit path only; --check uses None as a
+    # wildcard for the reason, and the inhibitor is required for --check.
+    if not args.check_inhibitor:
+        if args.inhibitor is None:
+            args.inhibitor = 'User'
+        if args.reason is None:
+            args.reason = 'Manually enabled'
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    socket_path = os.path.join(tempfile.gettempdir(), f'{os.path.basename(__file__)}-{os.getuid()}.socket')
+    socket_path = os.path.join(tempfile.gettempdir(), f'{_SCRIPT_BASENAME}-{os.getuid()}.socket')
     address = (socket_path, 'AF_UNIX')
 
     # Ensure socket file cleanup handlers are registered for common signals
@@ -307,11 +393,7 @@ if __name__ == '__main__':
 
     if args.list_inhibitors:
         try:
-            bus = dbus.SessionBus()
-            agent = bus.get_object('org.kde.Solid.PowerManagement.PolicyAgent',
-                                   '/org/kde/Solid/PowerManagement/PolicyAgent')
-            inhibitions = agent.ListInhibitions(
-                dbus_interface='org.kde.Solid.PowerManagement.PolicyAgent')
+            inhibitions = list_inhibitions()
         except dbus.exceptions.DBusException as e:
             print(f'Error querying PolicyAgent: {e}', file=sys.stderr)
             sys.exit(1)
@@ -322,6 +404,12 @@ if __name__ == '__main__':
         for app, reason in inhibitions:
             print(f'{app}: {reason}')
         sys.exit(0)
+
+    if args.check_inhibitor:
+        if args.inhibitor is None:
+            print('--check requires an inhibitor name', file=sys.stderr)
+            sys.exit(2)
+        sys.exit(0 if is_inhibition_held(args.inhibitor, args.reason) else 1)
 
     if args.release:
         close_existing(address, close_reasons.CLOSE_REQUESTED)
@@ -339,5 +427,10 @@ if __name__ == '__main__':
 
     # Ensure we release cookie on exit
     register_exit_function(get_cleanup_function(inhibitor, cookie))
+
+    # Publish what we're holding so `--check` can see it, and ensure the
+    # state file is cleaned up on exit.
+    write_state_file(args.inhibitor, args.reason)
+    register_exit_function(remove_state_file)
 
     listen_for_close(address)
