@@ -387,6 +387,14 @@ if __name__ == '__main__':
     socket_path = os.path.join(tempfile.gettempdir(), f'{_SCRIPT_BASENAME}-{os.getuid()}.socket')
     address = (socket_path, 'AF_UNIX')
 
+    # Handle --check before registering any exit/signal handlers: it must
+    # be a pure read-only query and never disturb a running instance.
+    if args.check_inhibitor:
+        if args.inhibitor is None:
+            print('--check requires an inhibitor name', file=sys.stderr)
+            sys.exit(2)
+        sys.exit(0 if is_inhibition_held(args.inhibitor, args.reason) else 1)
+
     # Ensure socket file cleanup handlers are registered for common signals
     register_exit_function(get_socket_cleaner(address, signal.SIGINT), signals=[signal.SIGINT])
     register_exit_function(get_socket_cleaner(address, signal.SIGTERM), signals=[signal.SIGTERM])
@@ -404,12 +412,6 @@ if __name__ == '__main__':
         for app, reason in inhibitions:
             print(f'{app}: {reason}')
         sys.exit(0)
-
-    if args.check_inhibitor:
-        if args.inhibitor is None:
-            print('--check requires an inhibitor name', file=sys.stderr)
-            sys.exit(2)
-        sys.exit(0 if is_inhibition_held(args.inhibitor, args.reason) else 1)
 
     if args.release:
         close_existing(address, close_reasons.CLOSE_REQUESTED)
