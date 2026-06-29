@@ -24,6 +24,8 @@ except ImportError:
     sys.exit(1)
 import tempfile
 import os
+import re
+import hashlib
 import signal
 import logging
 import time
@@ -217,30 +219,51 @@ def close_existing(address, reason:close_reasons):
 def listen_for_close(address, release_attempted=False):
     """Block and listen on the socket for a close request.
 
-    When a `CLOSE` message is received the numeric reason is read and
-    the function returns allowing cleanup to occur. If the socket path
-    is stale the first attempt will remove it and retry once.
+    Connections are accepted in a loop. A client that connects but never
+    sends a clean `close` (or half-closes) is dropped after a short poll
+    timeout instead of blocking the listener forever: the previous
+    single-`accept()`-then-`recv()` design could wedge permanently on such
+    a connection, leaving an inhibitor that no later `--release` could ever
+    reach. When a valid `CLOSE` message (followed by its numeric reason) is
+    received the function returns so cleanup can run. If the socket path is
+    stale the first attempt removes it and retries once.
     """
     try:
         listener = Listener(*address)
-        conn = listener.accept()
-        while True:
-            msg = conn.recv()
-            if msg.upper() == 'CLOSE':
-                # small pause to ensure the reason integer is transmitted
-                time.sleep(0.05)
-                reason = conn.recv()
-                break
-            logging.info(f'Closing due to {close_reasons.get_string(reason)}')
-        conn.close()
-    except OSError as e:
-        if release_attempted == False:
+    except OSError:
+        if not release_attempted:
             logging.info('Clearing existing socket')
             release_socket(address[0])
             listen_for_close(address, True)
-        else:
-            raise e
-        
+            return
+        raise
+
+    try:
+        while True:
+            conn = listener.accept()
+            try:
+                # A genuine close request sends "close" right away. If
+                # nothing arrives, drop this connection and accept the next
+                # rather than blocking in recv() indefinitely.
+                if not conn.poll(5):
+                    continue
+                msg = conn.recv()
+                if not (isinstance(msg, str) and msg.upper() == 'CLOSE'):
+                    continue
+                reason = conn.recv() if conn.poll(1) else None
+                if reason is not None:
+                    try:
+                        logging.info(f'Closing due to {close_reasons.get_string(close_reasons(reason))}')
+                    except Exception:
+                        pass
+                return
+            except (EOFError, OSError):
+                continue
+            finally:
+                conn.close()
+    finally:
+        listener.close()
+
 
 def list_inhibitions():
     """Return active inhibitions as a list of (app_name, reason) tuples.
@@ -256,11 +279,37 @@ def list_inhibitions():
     return [(str(app), str(reason)) for app, reason in raw]
 
 
-def state_file_path() -> str:
-    """Return the path of the state file describing the running instance."""
+def identity_slug(inhibitor: str) -> str:
+    """Return a filesystem-safe slug identifying an inhibitor.
+
+    Each logical lock is keyed by its inhibitor name (the first CLI
+    argument, e.g. `User` for the tray or `SSH` for the SSH watchdog) so
+    that independent locks get independent socket/state files and never
+    interfere. Common names like `User`, `SSH` or `org.kde.konsole` stay
+    human-readable; names containing characters unsafe for a filename (or
+    longer than 64 chars) are sanitised and disambiguated with a short hash
+    so two different names can never collide onto the same slug.
+    """
+    safe = re.sub(r'[^A-Za-z0-9._-]', '_', inhibitor)[:64]
+    if safe != inhibitor:
+        digest = hashlib.sha1(inhibitor.encode('utf-8')).hexdigest()[:8]
+        safe = f'{safe}-{digest}'
+    return safe
+
+
+def socket_path(inhibitor: str) -> str:
+    """Return the per-identity UNIX socket path for `inhibitor`."""
     return os.path.join(
         tempfile.gettempdir(),
-        f'{_SCRIPT_BASENAME}-{os.getuid()}.state',
+        f'{_SCRIPT_BASENAME}-{os.getuid()}-{identity_slug(inhibitor)}.socket',
+    )
+
+
+def state_file_path(inhibitor: str) -> str:
+    """Return the per-identity state file path for `inhibitor`."""
+    return os.path.join(
+        tempfile.gettempdir(),
+        f'{_SCRIPT_BASENAME}-{os.getuid()}-{identity_slug(inhibitor)}.state',
     )
 
 
@@ -270,9 +319,10 @@ def write_state_file(inhibitor: str, reason: str) -> None:
     KDE's PolicyAgent does not reliably expose registered inhibitions back
     via `ListInhibitions` on all Plasma versions, so we keep a small local
     file describing what this process is currently holding. The file is
-    removed by the `atexit`-registered cleanup on shutdown.
+    keyed by inhibitor identity and removed by the `atexit`-registered
+    cleanup on shutdown.
     """
-    path = state_file_path()
+    path = state_file_path(inhibitor)
     tmp = f'{path}.{os.getpid()}.tmp'
     try:
         with open(tmp, 'w') as f:
@@ -282,20 +332,20 @@ def write_state_file(inhibitor: str, reason: str) -> None:
         logging.exception('Failed to write state file')
 
 
-def remove_state_file() -> None:
-    """Remove the state file written by `write_state_file`."""
+def remove_state_file(inhibitor: str) -> None:
+    """Remove the state file written by `write_state_file` for `inhibitor`."""
     try:
-        os.unlink(state_file_path())
+        os.unlink(state_file_path(inhibitor))
     except FileNotFoundError:
         pass
     except OSError:
         logging.exception('Failed to remove state file')
 
 
-def read_state_file() -> Optional[tuple]:
+def read_state_file(inhibitor: str) -> Optional[tuple]:
     """Return (inhibitor, reason) from the state file, or None if absent."""
     try:
-        with open(state_file_path(), 'r') as f:
+        with open(state_file_path(inhibitor), 'r') as f:
             lines = f.read().splitlines()
         if len(lines) >= 2:
             return (lines[0], lines[1])
@@ -307,13 +357,28 @@ def read_state_file() -> Optional[tuple]:
 
 
 def is_inhibition_held(inhibitor: str, reason: Optional[str] = None) -> bool:
-    """Return True if this tool is currently holding a matching inhibition.
+    """Return True if a matching inhibition is currently active.
 
-    Reads the state file written by the running `pause-auto-sleep`
-    instance. Matches `inhibitor` exactly against the app name; if
-    `reason` is not None it must also match exactly.
+    Ground truth is the session PolicyAgent's live inhibition list, so a
+    `--check` cannot be fooled by a missing/stale state file while the
+    holding process is still alive (the failure mode that previously left
+    orphaned inhibitors un-released). The local state file is only used as
+    a fallback for Plasma versions whose `ListInhibitions` does not report
+    registered inhibitions back.
+
+    Matches `inhibitor` exactly against the app name; if `reason` is not
+    None it must also match exactly.
     """
-    state = read_state_file()
+    try:
+        for held_app, held_reason in list_inhibitions():
+            if held_app == inhibitor and (reason is None or held_reason == reason):
+                return True
+    except dbus.exceptions.DBusException:
+        # PolicyAgent unavailable or this Plasma version doesn't report
+        # inhibitions back; fall through to the local state file.
+        pass
+
+    state = read_state_file(inhibitor)
     if state is None:
         return False
     held_app, held_reason = state
@@ -331,23 +396,6 @@ def release_socket(path):
             os.remove(path)
     except Exception:
         logging.exception('Failed to remove socket file')
-
-def get_socket_cleaner(socket_address, sig):
-    """Return a callable that requests a close for a given signal.
-
-    The returned function maps common signals to `close_reasons` and
-    asks a running instance to terminate the inhibitor.
-    """
-    def socket_cleaner():
-        match sig:
-            case signal.SIGINT:
-                reason = close_reasons.CTRL_C
-            case signal.SIGTERM:
-                reason = close_reasons.TERM
-            case _:
-                reason = close_reasons.SIGNAL_RECEIVED
-        close_existing(socket_address, reason)
-    return socket_cleaner
 
 def get_cleanup_function(pm_bus: power_management_inhibitor, cookie: dbus.UInt32):
     """Return a cleanup callable that releases the inhibitor cookie.
@@ -384,9 +432,6 @@ if __name__ == '__main__':
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    socket_path = os.path.join(tempfile.gettempdir(), f'{_SCRIPT_BASENAME}-{os.getuid()}.socket')
-    address = (socket_path, 'AF_UNIX')
-
     # Handle --check before registering any exit/signal handlers: it must
     # be a pure read-only query and never disturb a running instance.
     if args.check_inhibitor:
@@ -394,10 +439,6 @@ if __name__ == '__main__':
             print('--check requires an inhibitor name', file=sys.stderr)
             sys.exit(2)
         sys.exit(0 if is_inhibition_held(args.inhibitor, args.reason) else 1)
-
-    # Ensure socket file cleanup handlers are registered for common signals
-    register_exit_function(get_socket_cleaner(address, signal.SIGINT), signals=[signal.SIGINT])
-    register_exit_function(get_socket_cleaner(address, signal.SIGTERM), signals=[signal.SIGTERM])
 
     if args.list_inhibitors:
         try:
@@ -413,9 +454,23 @@ if __name__ == '__main__':
             print(f'{app}: {reason}')
         sys.exit(0)
 
+    # Socket is keyed by inhibitor identity so independent locks (e.g. the
+    # tray's "User" and the watchdog's "SSH") never share a socket. By this
+    # point args.inhibitor has been defaulted to "User" for the non-check
+    # paths, so --release with no name targets the tray's lock.
+    address = (socket_path(args.inhibitor), 'AF_UNIX')
+
     if args.release:
         close_existing(address, close_reasons.CLOSE_REQUESTED)
         sys.exit(0)
+
+    # Install signal handlers so SIGINT/SIGTERM trigger a clean shutdown
+    # (releasing the inhibitor via the atexit-registered cleanups below)
+    # rather than a KeyboardInterrupt traceback. These handlers must NOT
+    # message the socket: this process is the listener, so sending a close
+    # on exit would tear down a *different* instance during handoff, and
+    # would make read-only invocations like --list kill the live lock.
+    register_exit_function(lambda: None, signals=[signal.SIGINT, signal.SIGTERM])
 
     # Ask any existing instance to exit (makes this run in toggle-style)
     close_existing(address, close_reasons.NEW_INSTANCE)
@@ -433,6 +488,6 @@ if __name__ == '__main__':
     # Publish what we're holding so `--check` can see it, and ensure the
     # state file is cleaned up on exit.
     write_state_file(args.inhibitor, args.reason)
-    register_exit_function(remove_state_file)
+    register_exit_function(functools.partial(remove_state_file, args.inhibitor))
 
     listen_for_close(address)

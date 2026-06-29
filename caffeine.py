@@ -10,9 +10,11 @@ Dependencies: PySide6 or PyQt6 (Qt6), python3
 Usage: run this file (optionally autostart it via KDE autostart/.desktop)
 """
 import os
+import re
 import sys
 import stat
 import shutil
+import hashlib
 import subprocess
 import tempfile
 import time
@@ -60,14 +62,32 @@ def find_script() -> str | None:
     return None
 
 
-def socket_path_for_script() -> str:
-    """Return the UNIX socket path used by `pause-auto-sleep`.
+def _identity_slug(inhibitor: str) -> str:
+    """Filesystem-safe slug for an inhibitor identity.
 
-    The path mirrors the script's own temporary socket naming scheme
-    (`/tmp/<basename>-<uid>.socket`).
+    Must stay in sync with `identity_slug` in the `pause-auto-sleep`
+    script so the tray watches the same socket the script creates.
+    """
+    safe = re.sub(r'[^A-Za-z0-9._-]', '_', inhibitor)[:64]
+    if safe != inhibitor:
+        digest = hashlib.sha1(inhibitor.encode('utf-8')).hexdigest()[:8]
+        safe = f'{safe}-{digest}'
+    return safe
+
+
+def socket_path_for_script(inhibitor: str) -> str:
+    """Return the per-identity UNIX socket path used by `pause-auto-sleep`.
+
+    The path mirrors the script's own naming scheme
+    (`/tmp/<basename>-<uid>-<identity>.socket`), so the tray inspects only
+    the socket for its own inhibitor identity and is unaffected by other
+    locks (e.g. an SSH watchdog) running concurrently.
     """
     name = os.path.basename(find_script() or 'pause-auto-sleep')
-    return os.path.join(tempfile.gettempdir(), f"{name}-{os.getuid()}.socket")
+    return os.path.join(
+        tempfile.gettempdir(),
+        f"{name}-{os.getuid()}-{_identity_slug(inhibitor)}.socket",
+    )
 
 
 def _has_unix_listener(path: str) -> bool:
@@ -91,15 +111,16 @@ def _has_unix_listener(path: str) -> bool:
     return False
 
 
-def is_paused() -> bool:
-    """Detect whether the inhibitor is currently active.
+def is_paused(inhibitor: str) -> bool:
+    """Detect whether the tray's own inhibitor identity is currently active.
 
-    Verifies a `pause-auto-sleep` instance is actually listening on its
-    UNIX socket. If the socket file exists but no process is accepting
-    connections (stale socket from a crashed/killed instance), it is
-    removed so subsequent toggles start a fresh inhibitor.
+    Verifies a `pause-auto-sleep` instance for `inhibitor` is actually
+    listening on its per-identity UNIX socket. If the socket file exists
+    but no process is accepting connections (stale socket from a
+    crashed/killed instance), it is removed so subsequent toggles start a
+    fresh inhibitor.
     """
-    path = socket_path_for_script()
+    path = socket_path_for_script(inhibitor)
     try:
         st = os.stat(path)
     except FileNotFoundError:
@@ -184,7 +205,7 @@ class CaffeineApp(QtWidgets.QApplication):
 
     def update_icon(self) -> None:
         """Set the tray icon and tooltip according to the pause state."""
-        if is_paused():
+        if is_paused(self.default_inhibitor):
             if not self.icon_on.isNull():
                 self.tray.setIcon(self.icon_on)
             else:
@@ -204,17 +225,17 @@ class CaffeineApp(QtWidgets.QApplication):
 
     def toggle_pause(self) -> None:
         """Toggle the pause state by launching or releasing `pause-auto-sleep`."""
-        if is_paused():
-            subprocess.run([self.script, '--release'])
+        if is_paused(self.default_inhibitor):
+            subprocess.run([self.script, '--release', self.default_inhibitor])
             time.sleep(0.2)
         else:
             subprocess.Popen([self.script, self.default_inhibitor, self.default_reason], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
 
     def release_pause(self) -> None:
-        """Best-effort release of any active inhibitor when quitting."""
+        """Best-effort release of the tray's own inhibitor when quitting."""
         try:
-            if is_paused():
-                subprocess.run([self.script, '--release'])
+            if is_paused(self.default_inhibitor):
+                subprocess.run([self.script, '--release', self.default_inhibitor])
         except Exception:
             pass
 
